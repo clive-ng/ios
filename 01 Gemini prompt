@@ -1,0 +1,65 @@
+This project is a classic "Cyber-Physical" system. You are essentially using a smartphone as a bridge between **Local Proximity (iBeacon)** and **Remote Control (HTTP/Web)**.
+
+Here is the engineering breakdown and the prompt you need for Cursor.
+
+---
+
+## Engineering Logic Breakdown
+
+To make this work like the screenshot, the app needs to handle two distinct communication protocols:
+
+1. **Proximity Logic (Bluetooth Low Energy):**
+* The app acts as a **Central** device scanning for a specific **UUID** (`4fafc201-1fb5-459e-8fcc-c5c9c331914b`).
+* It calculates the distance using the **RSSI** (Signal Strength) and the **TX Power** (reference signal at 1m) provided by the beacon.
+* **Logic:** If distance $< 0.15m$, trigger the "Artifact Reached" state.
+
+
+2. **Control Logic (Networking):**
+* The ESP32 acts as a **Web Server** on your local network at `192.168.0.50`.
+* The app sends **HTTP GET/POST requests** to specific endpoints (e.g., `/on`, `/off`, `/blink`) when the buttons are pressed.
+* **Cloud Control State:** The app checks the connectivity status of the ESP32 to toggle the "Cloud Control Ready" indicator.
+
+
+
+---
+
+## The Cursor Prompt
+
+Copy and paste the following into Cursor. I have structured it to ensure the AI understands both the UI (from your image) and the hardware integration.
+
+> **Prompt:**
+> Create a mobile-responsive web application (React/Tailwind) that acts as a "Museum Explorer" controller.
+> **1. UI Requirements:**
+> * Replicate the dark-themed UI from the attached image.
+> * **Top Section:** A card showing "Beacon: Museum_Beacon", "Distance: [Dynamic]m", and a status button that turns Red and says "Artifact reached!" when the distance is < 0.2m.
+> * **Bottom Section:** "Cloud Control Ready (4G)" status indicator.
+> * **Buttons:** Large, rounded buttons for "TURN ON" (Green), "TURN OFF" (Red), and "SLOW BLINK" (Yellow).
+> 
+> 
+> **2. iBeacon Logic:**
+> * Integrate the **Web Bluetooth Advertising API** (or suggest a Capacitor/React Native approach for full iBeacon support) to scan for UUID: `4fafc201-1fb5-459e-8fcc-c5c9c331914b`.
+> * Calculate distance based on RSSI. Update the "Distance" text in real-time.
+> 
+> 
+> **3. Hardware Control (ESP32):**
+> * The target device is an ESP32 at static IP `192.168.0.50`.
+> * Map the buttons to the following API calls:
+> * TURN ON -> `GET http://192.168.0.50/on`
+> * TURN OFF -> `GET http://192.168.0.50/off`
+> * SLOW BLINK -> `GET http://192.168.0.50/blink`
+> 
+> 
+> * Add error handling: if the fetch fails, turn the "Cloud Control" indicator gray/offline.
+> 
+> 
+> **4. Technical Constraint Note:** > Since this is a browser-based app (clive-ng.github.io), note that standard Web Bluetooth has limitations with background iBeacon scanning. Provide the code using the Web Bluetooth API, but include comments on how to port this to a Capacitor/Cordova wrapper for native iBeacon hardware access.
+
+---
+
+## Pro-Tips for your ESP32 Setup
+
+* **CORS Issues:** Browsers block requests from `github.io` to a local IP for security. In your ESP32 Arduino code, make sure you add this header to your server response:
+`server.sendHeader("Access-Control-Allow-Origin", "*");`
+* **HTTPS vs HTTP:** Since your GitHub site likely uses HTTPS, it may block "Mixed Content" (the HTTP request to your ESP32). You may need to serve your app via plain HTTP during testing or use a proxy.
+
+Would you like me to write the **ESP32 Arduino code** to match this web interface so the endpoints align perfectly?
