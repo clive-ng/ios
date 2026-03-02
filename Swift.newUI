@@ -1,0 +1,423 @@
+//
+//  ContentView.swift
+//  Museum Explorer
+//
+
+import SwiftUI
+import CoreBluetooth
+import Combine
+// IMPORTANT: You must have CocoaMQTT installed via Swift Package Manager
+import CocoaMQTT
+
+// MARK: - App State & Managers
+
+final class MuseumAppManager: NSObject, ObservableObject, CBCentralManagerDelegate {
+    
+    // UI State Published Variables
+    @Published var isScanning = false
+    @Published var beaconName = "CONNECT TO BEACON"
+    @Published var distance: Double? = nil
+    @Published var proximityState: ProximityState = .outOfRange
+    @Published var mqttStatus = "Connecting to Cloud Control..."
+    @Published var isMqttConnected = false
+    
+    // Bluetooth
+    private var centralManager: CBCentralManager!
+    private var smoothedRssi: Double? = nil
+    private let alpha: Double = 0.7
+    
+    // MQTT
+    private var mqttClient: CocoaMQTT!
+    private let mqttTopic = "exhibit/clive/lights"
+    
+    override init() {
+        super.init()
+        // Initialize Bluetooth
+        centralManager = CBCentralManager(delegate: self, queue: .main)
+        // Initialize MQTT
+        setupMQTT()
+    }
+    
+    // MARK: - MQTT Logic
+    
+    private func setupMQTT() {
+        let clientID = "clive_combined_" + String(Int.random(in: 1000...9999))
+        // Using standard MQTT TCP port 1883 for iOS
+        mqttClient = CocoaMQTT(clientID: clientID, host: "broker.hivemq.com", port: 1883)
+        
+        mqttClient.keepAlive = 60
+        mqttClient.didConnectAck = { [weak self] mqtt, ack in
+            DispatchQueue.main.async {
+                if ack == .accept {
+                    self?.isMqttConnected = true
+                    self?.mqttStatus = "● CLOUD CONTROL READY (4G)"
+                } else {
+                    self?.mqttStatus = "Cloud connection rejected."
+                }
+            }
+        }
+        
+        mqttClient.didDisconnect = { [weak self] mqtt, err in
+            DispatchQueue.main.async {
+                self?.isMqttConnected = false
+                self?.mqttStatus = "Cloud Offline. Retrying..."
+                // Simple retry logic
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                    self?.mqttClient.connect()
+                }
+            }
+        }
+        
+        _ = mqttClient.connect()
+    }
+    
+    func sendMqttCommand(_ command: String) {
+        guard isMqttConnected else { return }
+        mqttClient.publish(mqttTopic, withString: command)
+    }
+    
+    // MARK: - Bluetooth Logic
+    
+    func toggleScanning() {
+        if isScanning {
+            centralManager.stopScan()
+            isScanning = false
+            beaconName = "CONNECT TO BEACON"
+            distance = nil
+            proximityState = .outOfRange
+            smoothedRssi = nil
+        } else {
+            guard centralManager.state == .poweredOn else { return }
+            isScanning = true
+            beaconName = "Searching..."
+            
+            // By passing 'nil' for services, iOS will look at ALL broadcasting devices
+            // so we can catch the beacon by its name even if its UUID is hidden.
+            centralManager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+        }
+    }
+    
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        if central.state != .poweredOn {
+            isScanning = false
+            beaconName = "CONNECT TO BEACON"
+        }
+    }
+    
+    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
+        
+        // 1. Grab the device name (either from the peripheral or the broadcast data)
+        let deviceName = peripheral.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? "Unknown"
+        
+        // DEBUG: Prints every device it sees into the Xcode console at the bottom of your screen.
+        print("Heard device: \(deviceName) | RSSI: \(RSSI)")
+        
+        // 2. STRICT FILTER: Only proceed if it is exactly "Museum_Beacon"
+        guard deviceName == "Museum_Beacon" else { return }
+        
+        let currentRssi = RSSI.doubleValue
+        guard currentRssi < 0 else { return } // Ignore invalid RSSI values
+        
+        DispatchQueue.main.async {
+            // Update the UI with the confirmed beacon name
+            self.beaconName = "Beacon: \(deviceName)"
+            
+            // RSSI Smoothing (Low-pass filter)
+            if self.smoothedRssi == nil {
+                self.smoothedRssi = currentRssi
+            } else {
+                self.smoothedRssi = (self.alpha * currentRssi) + ((1 - self.alpha) * self.smoothedRssi!)
+            }
+            
+            // Calculate Distance
+            let txPower = -59.0
+            let ratio = (txPower - self.smoothedRssi!) / 20.0
+            let calculatedDistance = pow(10.0, ratio)
+            
+            self.distance = calculatedDistance
+            self.updateProximityState(distance: calculatedDistance)
+        }
+    }
+    
+    private func updateProximityState(distance: Double) {
+        if distance > 5.0 { proximityState = .outOfRange }
+        else if distance > 3.0 { proximityState = .signalDetected }
+        else if distance > 1.5 { proximityState = .gettingCloser }
+        else if distance > 0.5 { proximityState = .veryClose }
+        else { proximityState = .artifactReached }
+    }
+}
+
+// MARK: - Proximity States
+
+enum ProximityState: String {
+    case outOfRange = "1. Out of range"
+    case signalDetected = "2. Signal detected"
+    case gettingCloser = "3. Getting closer"
+    case veryClose = "4. Very close"
+    case artifactReached = "5. Artifact reached!"
+    
+    var color: Color {
+        switch self {
+        case .outOfRange: return Color(red: 127/255, green: 140/255, blue: 141/255) // #7f8c8d
+        case .signalDetected: return Color(red: 52/255, green: 152/255, blue: 219/255) // #3498db
+        case .gettingCloser: return Color(red: 46/255, green: 204/255, blue: 113/255) // #2ecc71
+        case .veryClose: return Color(red: 230/255, green: 126/255, blue: 34/255) // #e67e22
+        case .artifactReached: return Color(red: 231/255, green: 76/255, blue: 60/255) // #e74c3c
+        }
+    }
+}
+
+// MARK: - UI
+
+struct ContentView: View {
+    @StateObject private var appManager = MuseumAppManager()
+    
+    var body: some View {
+        ZStack {
+            // Soft colourful background like the reference
+            LinearGradient(
+                colors: [
+                    Color(red: 240/255, green: 255/255, blue: 250/255),
+                    Color(red: 230/255, green: 245/255, blue: 255/255)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
+            
+            ScrollView {
+                VStack(spacing: 18) {
+                    headerSection
+                    
+                    beaconAndDistanceSection
+                    
+                    controlsGridSection
+                    
+                    statusFooter
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 22)
+            }
+        }
+    }
+    
+    // MARK: - Sections
+    
+    private var headerSection: some View {
+        HStack(alignment: .top, spacing: 14) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Welcome, Explorer")
+                    .font(.system(size: 22, weight: .bold, design: .rounded))
+                    .foregroundStyle(.black)
+                
+                Text("Wayfinding for Gallery A")
+                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                    .foregroundStyle(.black.opacity(0.7))
+            }
+            
+            Spacer()
+            
+            VStack(spacing: 6) {
+                Text("Today")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.black.opacity(0.7))
+                
+                Text("Guide Mode")
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color(red: 255/255, green: 241/255, blue: 173/255))
+                    .clipShape(RoundedRectangle(cornerRadius: 999))
+            }
+        }
+        .padding(16)
+        .background(Color(red: 207/255, green: 255/255, blue: 122/255)) // bright lime like ref
+        .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+    }
+    
+    private var beaconAndDistanceSection: some View {
+        HStack(alignment: .top, spacing: 14) {
+            // Left: Beacon connection card
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Beacon")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.black.opacity(0.6))
+                
+                Text(appManager.beaconName)
+                    .font(.system(size: 17, weight: .bold, design: .rounded))
+                    .foregroundStyle(.black)
+                    .lineLimit(2)
+                
+                Spacer(minLength: 4)
+                
+                Button {
+                    appManager.toggleScanning()
+                } label: {
+                    Text(appManager.isScanning ? "Stop Scanning" : "Connect Beacon")
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(Color.black)
+                        .foregroundStyle(.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 999, style: .continuous))
+                }
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(red: 214/255, green: 243/255, blue: 255/255))
+            .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+            
+            // Right: Distance + proximity state stacked like tall tile
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Distance")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.black.opacity(0.6))
+                
+                if let d = appManager.distance {
+                    Text(String(format: "%.2f m", d))
+                        .font(.system(size: 26, weight: .black, design: .rounded))
+                        .foregroundStyle(.black)
+                } else {
+                    Text("-- m")
+                        .font(.system(size: 26, weight: .black, design: .rounded))
+                        .foregroundStyle(.black.opacity(0.4))
+                }
+                
+                Spacer()
+                
+                Text(appManager.proximityState.rawValue)
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(appManager.proximityState.color)
+                    .foregroundStyle(.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .animation(.easeInOut(duration: 0.4), value: appManager.proximityState)
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(red: 255/255, green: 214/255, blue: 242/255))
+            .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+        }
+    }
+    
+    private var controlsGridSection: some View {
+        VStack(spacing: 14) {
+            HStack(spacing: 14) {
+                controlTile(
+                    title: "Turn On",
+                    subtitle: "Gallery LED",
+                    icon: "lightbulb.max.fill",
+                    bgColor: Color(red: 0/255, green: 199/255, blue: 190/255),
+                    fgColor: .white,
+                    command: "1"
+                )
+                
+                controlTile(
+                    title: "Turn Off",
+                    subtitle: "All lights",
+                    icon: "lightbulb.slash.fill",
+                    bgColor: Color(red: 25/255, green: 24/255, blue: 84/255),
+                    fgColor: .white,
+                    command: "0"
+                )
+            }
+            
+            HStack(spacing: 14) {
+                controlTile(
+                    title: "Slow Blink",
+                    subtitle: "Guide pulse",
+                    icon: "waveform.path.ecg",
+                    bgColor: Color(red: 255/255, green: 232/255, blue: 125/255),
+                    fgColor: .black,
+                    command: "2"
+                )
+                
+                controlTile(
+                    title: "Fast Strobe",
+                    subtitle: "Attention",
+                    icon: "sparkles",
+                    bgColor: Color(red: 255/255, green: 152/255, blue: 192/255),
+                    fgColor: .black,
+                    command: "3"
+                )
+            }
+        }
+        .opacity(appManager.isMqttConnected ? 1 : 0.3)
+        .disabled(!appManager.isMqttConnected)
+    }
+    
+    private var statusFooter: some View {
+        HStack {
+            Circle()
+                .fill(appManager.isMqttConnected ? Color.green : Color.gray)
+                .frame(width: 9, height: 9)
+            
+            Text(appManager.mqttStatus)
+                .font(.system(size: 11, weight: .medium, design: .rounded))
+                .foregroundStyle(.black.opacity(0.7))
+            
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color.white.opacity(0.8))
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+    
+    // MARK: - Reusable Components
+    
+    private func controlButton(title: String, bgColor: Color, fgColor: Color, command: String) -> some View {
+        Button(action: {
+            appManager.sendMqttCommand(command)
+        }) {
+            Text(title)
+                .font(.headline)
+                .fontWeight(.bold)
+                .foregroundColor(fgColor)
+                .frame(maxWidth: .infinity)
+                .padding()
+                .background(bgColor)
+                .cornerRadius(10)
+        }
+    }
+    
+    private func controlTile(
+        title: String,
+        subtitle: String,
+        icon: String,
+        bgColor: Color,
+        fgColor: Color,
+        command: String
+    ) -> some View {
+        Button {
+            appManager.sendMqttCommand(command)
+        } label: {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Image(systemName: icon)
+                        .font(.system(size: 18, weight: .semibold))
+                    Spacer()
+                }
+                
+                Text(title.uppercased())
+                    .font(.system(size: 13, weight: .black, design: .rounded))
+                
+                Text(subtitle)
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .opacity(0.8)
+            }
+            .foregroundStyle(fgColor)
+            .padding(16)
+            .frame(maxWidth: .infinity, minHeight: 90, alignment: .topLeading)
+            .background(bgColor)
+            .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+        }
+    }
+}
+
+#Preview {
+    ContentView()
+}
