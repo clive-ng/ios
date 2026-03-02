@@ -1,0 +1,327 @@
+//
+//  ContentView.swift
+//  Museum Explorer
+//
+
+import SwiftUI
+import CoreBluetooth
+import Combine
+import AVFoundation
+import CocoaMQTT
+
+// MARK: - App State & Managers
+
+// Voice-synthesized announcements – no external sound file needed
+final class MuseumSoundManager {
+    static let shared = MuseumSoundManager()
+    
+    private let synthesizer = AVSpeechSynthesizer()
+    private var isReady = false
+    
+    private init() {
+        setupAudioSession()
+    }
+    
+    private func setupAudioSession() {
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
+            try session.setActive(true)
+            isReady = true
+        } catch {
+            print("[MuseumSound] Failed to setup audio session: \(error)")
+        }
+    }
+    
+    func play(for proximity: ProximityState) {
+        guard isReady else { return }
+        
+        if synthesizer.isSpeaking {
+            synthesizer.stopSpeaking(at: .immediate)
+        }
+        
+        let textToSpeak: String
+        switch proximity {
+        case .outOfRange: textToSpeak = "Out of range."
+        case .signalDetected: textToSpeak = "Signal detected."
+        case .gettingCloser: textToSpeak = "Getting closer."
+        case .veryClose: textToSpeak = "Very close."
+        case .artifactReached: textToSpeak = "Artifact reached!"
+        }
+        
+        let utterance = AVSpeechUtterance(string: textToSpeak)
+        utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+        utterance.rate = 0.5
+        utterance.pitchMultiplier = 1.1
+        
+        synthesizer.speak(utterance)
+    }
+}
+
+final class MuseumAppManager: NSObject, ObservableObject, CBCentralManagerDelegate {
+    
+    // UI State Published Variables
+    @Published var isScanning = false
+    @Published var beaconName = "CONNECT TO BEACON"
+    @Published var distance: Double? = nil
+    @Published var proximityState: ProximityState = .outOfRange
+    @Published var mqttStatus = "Connecting to Cloud..."
+    @Published var isMqttConnected = false
+    
+    // Bluetooth
+    private var centralManager: CBCentralManager!
+    private var smoothedRssi: Double? = nil
+    private let alpha: Double = 0.7
+    private var lastProximityState: ProximityState = .outOfRange
+    private var lastUpdateTime = Date()
+    
+    // MQTT
+    private var mqttClient: CocoaMQTT!
+    private let mqttTopic = "exhibit/clive/lights"
+    
+    override init() {
+        super.init()
+        centralManager = CBCentralManager(delegate: self, queue: .main)
+        setupMQTT()
+    }
+    
+    // MARK: - MQTT Logic
+    private func setupMQTT() {
+        let clientID = "clive_combined_" + String(Int.random(in: 1000...9999))
+        mqttClient = CocoaMQTT(clientID: clientID, host: "broker.hivemq.com", port: 1883)
+        mqttClient.keepAlive = 60
+        
+        mqttClient.didConnectAck = { [weak self] mqtt, ack in
+            DispatchQueue.main.async {
+                if ack == .accept {
+                    self?.isMqttConnected = true
+                    self?.mqttStatus = "Cloud Connected"
+                } else {
+                    self?.mqttStatus = "Connection Rejected"
+                }
+            }
+        }
+        
+        mqttClient.didDisconnect = { [weak self] mqtt, err in
+            DispatchQueue.main.async {
+                self?.isMqttConnected = false
+                self?.mqttStatus = "Cloud Offline. Retrying..."
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                    self?.mqttClient.connect()
+                }
+            }
+        }
+        _ = mqttClient.connect()
+    }
+    
+    func sendMqttCommand(_ command: String) {
+        guard isMqttConnected else { return }
+        mqttClient.publish(mqttTopic, withString: command)
+    }
+    
+    // MARK: - Bluetooth Logic
+    func toggleScanning() {
+        if isScanning {
+            centralManager.stopScan()
+            isScanning = false
+            beaconName = "CONNECT TO BEACON"
+            distance = nil
+            proximityState = .outOfRange
+            smoothedRssi = nil
+        } else {
+            guard centralManager.state == .poweredOn else { return }
+            isScanning = true
+            beaconName = "Searching..."
+            centralManager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+        }
+    }
+    
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        if central.state != .poweredOn {
+            isScanning = false
+            beaconName = "Bluetooth Off"
+        }
+    }
+    
+    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
+        let deviceName = peripheral.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? "Unknown"
+        guard deviceName == "Museum_Beacon" else { return }
+        
+        let currentRssi = RSSI.doubleValue
+        guard currentRssi < 0 else { return }
+        
+        // Throttle UI updates to max 4 times per second
+        let now = Date()
+        guard now.timeIntervalSince(lastUpdateTime) > 0.25 else { return }
+        lastUpdateTime = now
+        
+        DispatchQueue.main.async {
+            self.beaconName = "Beacon Connected"
+            
+            if self.smoothedRssi == nil {
+                self.smoothedRssi = currentRssi
+            } else {
+                self.smoothedRssi = (self.alpha * currentRssi) + ((1 - self.alpha) * self.smoothedRssi!)
+            }
+            
+            let txPower = -59.0
+            let ratio = (txPower - self.smoothedRssi!) / 20.0
+            let calculatedDistance = pow(10.0, ratio)
+            
+            self.distance = calculatedDistance
+            self.updateProximityState(distance: calculatedDistance)
+        }
+    }
+    
+    private func updateProximityState(distance: Double) {
+        let newState: ProximityState
+        
+        if distance > 5.0 { newState = .outOfRange }
+        else if distance > 3.0 { newState = .signalDetected }
+        else if distance > 1.5 { newState = .gettingCloser }
+        else if distance > 0.5 { newState = .veryClose }
+        else { newState = .artifactReached }
+        
+        if newState != proximityState {
+            proximityState = newState
+            lastProximityState = newState
+            MuseumSoundManager.shared.play(for: newState)
+        }
+    }
+}
+
+// MARK: - Proximity States
+
+enum ProximityState: String {
+    case outOfRange = "1. Out of range"
+    case signalDetected = "2. Signal detected"
+    case gettingCloser = "3. Getting closer"
+    case veryClose = "4. Very close"
+    case artifactReached = "5. Artifact reached!"
+    
+    var color: Color {
+        switch self {
+        case .outOfRange: return Color(red: 127/255, green: 140/255, blue: 141/255)
+        case .signalDetected: return Color(red: 52/255, green: 152/255, blue: 219/255)
+        case .gettingCloser: return Color(red: 46/255, green: 204/255, blue: 113/255)
+        case .veryClose: return Color(red: 230/255, green: 126/255, blue: 34/255)
+        case .artifactReached: return Color(red: 231/255, green: 76/255, blue: 60/255)
+        }
+    }
+}
+
+// MARK: - UI
+
+struct ContentView: View {
+    @StateObject private var appManager = MuseumAppManager()
+    
+    var body: some View {
+        ZStack {
+            Color(red: 240/255, green: 240/255, blue: 240/255)
+                .ignoresSafeArea()
+            
+            VStack(spacing: 24) {
+                // Header
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Museum")
+                        .font(.system(size: 34, weight: .bold))
+                        .foregroundColor(.black)
+                    Text("Wayfinding for Gallery")
+                        .font(.system(size: 16, weight: .regular))
+                        .foregroundColor(.black.opacity(0.7))
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                
+                // Top row circles: connect + distance
+                HStack(spacing: 16) {
+                    Button {
+                        appManager.toggleScanning()
+                    } label: {
+                        ZStack {
+                            Circle()
+                                .fill(appManager.isScanning ? Color.green : Color.orange)
+                                .frame(width: 150, height: 150)
+                            
+                            Text(appManager.isScanning ? "Stop\nScanning" : "Connect\nto Beacon")
+                                .font(.system(size: 18, weight: .bold))
+                                .foregroundColor(appManager.isScanning ? .white : .black)
+                                .multilineTextAlignment(.center)
+                        }
+                    }
+                    
+                    ZStack {
+                        Circle()
+                            .fill(Color.white)
+                            .frame(width: 150, height: 150)
+                            .shadow(color: .black.opacity(0.05), radius: 10, x: 0, y: 5)
+                        
+                        Text(appManager.distance != nil ? String(format: "%.1fm", appManager.distance!) : "--m")
+                            .font(.system(size: 32, weight: .bold))
+                            .foregroundColor(.black)
+                    }
+                }
+                
+                // Proximity pill
+                RoundedRectangle(cornerRadius: 30, style: .continuous)
+                    .fill(appManager.proximityState.color)
+                    .frame(height: 100)
+                    .overlay(
+                        Text(appManager.proximityState == .outOfRange ? "Out of range" : appManager.proximityState.rawValue.replacingOccurrences(of: "^[0-9]+\\.\\s*", with: "", options: .regularExpression))
+                            .font(.system(size: 28, weight: .bold))
+                            .foregroundColor(.white)
+                    )
+                    .padding(.horizontal, 16)
+                    .animation(.easeInOut(duration: 0.3), value: appManager.proximityState)
+                
+                Spacer()
+                
+                // MQTT Status
+                Text(appManager.mqttStatus)
+                    .font(.caption)
+                    .foregroundColor(appManager.isMqttConnected ? .green : .red)
+                    .textCase(.uppercase)
+                
+                // Bottom row circular controls
+                VStack(spacing: 16) {
+                    HStack(spacing: 16) {
+                        controlCircle(title: "ON", bgColor: .white, fgColor: .black, command: "1")
+                        controlCircle(title: "OFF", bgColor: Color(white: 0.2), fgColor: .white, command: "0")
+                    }
+                    
+                    HStack(spacing: 16) {
+                        controlCircle(title: "BLINK", bgColor: .blue, fgColor: .white, command: "2")
+                        controlCircle(title: "FLASH", bgColor: .red, fgColor: .white, command: "3")
+                    }
+                }
+                .opacity(appManager.isMqttConnected ? 1.0 : 0.4)
+                .disabled(!appManager.isMqttConnected)
+                .padding(.bottom, 32)
+            }
+            .padding(.top, 16)
+        }
+    }
+    
+    // Reusable Button Component
+    private func controlCircle(title: String, bgColor: Color, fgColor: Color, command: String) -> some View {
+        Button {
+            let impact = UIImpactFeedbackGenerator(style: .medium)
+            impact.impactOccurred()
+            appManager.sendMqttCommand(command)
+        } label: {
+            ZStack {
+                Circle()
+                    .fill(bgColor)
+                    .frame(width: 130, height: 130)
+                    .shadow(color: .black.opacity(0.1), radius: 5, x: 0, y: 5)
+                Text(title)
+                    .font(.system(size: 20, weight: .bold))
+                    .foregroundColor(fgColor)
+            }
+        }
+    }
+}
+
+#Preview {
+    ContentView()
+}
