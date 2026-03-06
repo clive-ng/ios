@@ -220,7 +220,7 @@ struct ContentView: View {
             Color(red: 240/255, green: 240/255, blue: 240/255)
                 .ignoresSafeArea()
             
-            VStack(spacing: 24) {
+            VStack(spacing: 16) {
                 // Header
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Museum")
@@ -256,7 +256,7 @@ struct ContentView: View {
                             .frame(width: 150, height: 150)
                             .shadow(color: .black.opacity(0.05), radius: 10, x: 0, y: 5)
                         
-                        Text(appManager.distance != nil ? String(format: "%.1fm", appManager.distance!) : "--m")
+                        Text(appManager.distance != nil ? String(format: "%.1fm", appManager.distance!) : "...")
                             .font(.system(size: 32, weight: .bold))
                             .foregroundColor(.black)
                     }
@@ -273,8 +273,6 @@ struct ContentView: View {
                     )
                     .padding(.horizontal, 16)
                     .animation(.easeInOut(duration: 0.3), value: appManager.proximityState)
-                
-                Spacer()
                 
                 // MQTT Status
                 Text(appManager.mqttStatus)
@@ -312,7 +310,7 @@ struct ContentView: View {
             ZStack {
                 Circle()
                     .fill(bgColor)
-                    .frame(width: 130, height: 130)
+                    .frame(width: 150, height: 150)
                     .shadow(color: .black.opacity(0.1), radius: 5, x: 0, y: 5)
                 Text(title)
                     .font(.system(size: 20, weight: .bold))
